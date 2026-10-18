@@ -1,31 +1,42 @@
 --Credit: Discord Username: naitsirhc._ | Roblox Username: Skeeredd
 --!strict
 
--- Store each service once so every part of the script uses the same service
-local Players = game:GetService("Players") -- PlayerRemoving uses these server player objects
-local RunService = game:GetService("RunService") -- Heartbeat runs the update loop
-local TweenService = game:GetService("TweenService") -- TweenService moves the door and shutter
-local ProximityPromptService = game:GetService("ProximityPromptService") -- One event handles every prompt
-local ServerStorage = game:GetService("ServerStorage") -- ServerStorage keeps the beam template off the client
+-- Services are fetched once so every function shares one reference instead of calling GetService again
+local Players = game:GetService("Players") -- Builds the character filter for the doorway check and fires PlayerRemoving for cooldown cleanup
+local TweenService = game:GetService("TweenService") -- Interpolates CFrame on the server, and the anchored parts replicate the motion to every client
+local ProximityPromptService = game:GetService("ProximityPromptService") -- PromptTriggered fires for every prompt in the place, so one connection serves all controls
+local ServerStorage = game:GetService("ServerStorage") -- Clients cannot see ServerStorage, so the beam template only replicates once the server clones it
 
--- These limits keep every ray check small and safe
-local MAX_SEGMENTS = 12 -- Stop a beam after a fixed number of hits
-local MAX_DISTANCE = 180 -- Use one distance limit for the full beam path
-local SURFACE_OFFSET = 0.025 -- Leave a small gap so the next ray does not hit the same face
-local TRACE_INTERVAL = 1 / 30 -- Wait between ray checks when parts change
+-- A beam bouncing between two facing mirrors would never stop, so a hop count and a shared length both cap the loop
+local MAX_SEGMENTS = 12 -- Each hop costs one Raycast and one pooled part, so this number is also the pool size per circuit
+local MAX_DISTANCE = 180 -- Length budget shared by every hop, so a beam that leaves through a gap is not drawn across the whole map
+local SURFACE_OFFSET = 0.025 -- The next ray starts this far off the mirror, because a ray starting on the face can hit that same face at distance 0
+local EDGE_THRESHOLD = 0.99 -- The reflective faces of a mirror have an object-space normal of almost exactly +Z or -Z, every other face is an edge
+local BEAM_THICKNESS = 0.09 -- X and Y size of every beam part, only the Z size follows the segment length
 
--- Mirror rotation uses eight fixed steps
-local ROTATION_STEPS = 8 -- Convert every mirror value into one of eight steps
-local INPUT_COOLDOWN = 0.18 -- Stop one player from using prompts too fast
+-- Mirrors snap to 45 degree steps, so an axis-aligned beam always leaves a mirror axis-aligned and the puzzle has exact solutions
+local ROTATION_STEPS = 8 -- 8 steps of 45 degrees make one full turn, and the modulo in setMirrorStep wraps the count back to 0
+local STEP_ANGLE = 2 * math.pi / ROTATION_STEPS -- Radians per step, computed once because CFrame.Angles takes radians
+local INPUT_COOLDOWN = 0.18 -- Holding the prompt key retriggers fast, so each player gets a short server-side cooldown
 
--- Each color marks one source and its receiver
-local CYAN = Color3.fromRGB(71, 226, 255) -- Cyan marks the first circuit
-local ORANGE = Color3.fromRGB(255, 181, 76) -- Orange marks the second circuit
-local DIM = Color3.fromRGB(60, 76, 93) -- Dim is the color for a receiver that is off
+-- Tween settings are built once and reused, since TweenInfo is immutable and safe to share between tweens
+local DOOR_TWEEN = TweenInfo.new(0.7, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut) -- Quad InOut eases both ends, so the heavy door does not snap at the start or stop
+local SHUTTER_TWEEN = TweenInfo.new(0.3) -- The shutter is small, so a short linear slide is enough
+local DOOR_LIFT = 8.9 -- Gap between the top of the closed door and the top of the lintel, so the open door sits fully inside the lintel
+local SHUTTER_DROP = 8 -- Lowers the shutter from above the beam height into the cyan beam path
 
--- Types show the data shared by the main parts of the script
+local DIM = Color3.fromRGB(60, 76, 93) -- Unpowered receiver colour, dark so the powered circuit colour stands out
+
+-- One row per source/receiver pair, matched to Studio parts by name, so a new circuit needs one row and two parts
+local CIRCUIT_TYPES = {
+	{ name = "CYAN", color = Color3.fromRGB(71, 226, 255) },
+	{ name = "ORANGE", color = Color3.fromRGB(255, 181, 76) },
+}
+
+-- Routing accepts input, Solved locks the puzzle with the door open, Resetting waits for the doorway to clear
 type Mode = "Routing" | "Solved" | "Resetting"
 
+-- origin keeps only the mirror position, so a rotation is always applied to a clean CFrame and never adds up float error
 type Mirror = {
 	part: BasePart,
 	origin: CFrame,
@@ -33,6 +44,7 @@ type Mirror = {
 	initial: number,
 }
 
+-- pool holds the beam parts made at startup, and used counts how many the last trace showed, so a shorter path knows what to hide
 type Circuit = {
 	source: BasePart,
 	receiver: BasePart,
@@ -40,420 +52,350 @@ type Circuit = {
 	pool: { BasePart },
 	used: number,
 	powered: boolean,
-	termination: string,
 }
 
--- These references point to parts made in Studio
-local lab = workspace:WaitForChild("PhotonLab") -- Stop clearly if the Studio model is missing
+-- A table keyed by Mode replaces an if/elseif chain, and the Mode type makes a missing state a type error
+local STATUS: { [Mode]: string } = {
+	Routing = "CONNECT BOTH BEAMS!",
+	Solved = "PUZZLE SOLVED!",
+	Resetting = "RESETTING",
+}
 
-local optics = lab:WaitForChild("Optics") -- Only these parts can affect a ray
-local emitters = lab:WaitForChild("Emitters") -- Sources give each circuit its first position and direction
-local controls = lab:WaitForChild("Controls") -- Prompts in this folder control the puzzle
-local visuals = lab:WaitForChild("Runtime") -- These parts show beams and do not block rays
+-- WaitForChild makes the script wait for the Studio model instead of failing on a nil index if it streams in late
+local lab = workspace:WaitForChild("PhotonLab")
+local optics = lab:WaitForChild("Optics") -- The only folder rays can hit, so beam parts and decoration never block a beam
+local emitters = lab:WaitForChild("Emitters") -- Each source gives its circuit a start position and, through its LookVector, a start direction
+local controls = lab:WaitForChild("Controls") -- Every ProximityPrompt lives here, so the prompt list is collected from one folder
+local visuals = lab:WaitForChild("Runtime") -- Pooled beam parts are parented here, outside Optics, so they are never raycast targets
 
-local door = lab:WaitForChild("Door") :: BasePart -- The door is moved and checked for players
-local shutter = optics:WaitForChild("Shutter") :: BasePart -- The shutter blocks a beam when lowered
-local console = controls:WaitForChild("Console") :: BasePart -- The SurfaceGui on this part shows the mode
+local door = lab:WaitForChild("Door") :: BasePart -- The cast tells the type checker that CFrame and CanCollide exist on this instance
+local doorZone = lab:WaitForChild("DoorZone") :: BasePart -- Invisible CanTouch volume around the doorway that gives Touched events for the reset safety
+local shutter = optics:WaitForChild("Shutter") :: BasePart -- In Optics so it absorbs the beam when lowered
+local readout = controls:WaitForChild("Console"):WaitForChild("Sign"):WaitForChild("Readout") :: TextLabel -- Cached once because setMode writes to it on every mode change
+local segmentTemplate = ServerStorage:WaitForChild("LaserSegmentTemplate") :: BasePart -- Neon, anchored, no collision or query, so clones only need size and colour
 
-local segmentTemplate = ServerStorage:WaitForChild("LaserSegmentTemplate") :: BasePart -- Clone this Studio template for every beam part
-
--- Save the starting CFrames so reset always uses the same positions
+-- Poses are saved before anything moves, so reset and close always return to the exact authored CFrame
 local closedDoor = door.CFrame
-local raisedDoor = closedDoor + Vector3.new(0, 10, 0)
-
+local raisedDoor = closedDoor + Vector3.new(0, DOOR_LIFT, 0) -- Adding a Vector3 to a CFrame moves it in world space and keeps the rotation
 local openShutter = shutter.CFrame
-local blockedShutter = openShutter - Vector3.new(0, 8, 0)
+local blockedShutter = openShutter - Vector3.new(0, SHUTTER_DROP, 0)
 
--- Runtime tables keep mirror data, circuit data, and player times
-local mirrors: { [BasePart]: Mirror } = {} -- The part is the key used to find its mirror data
-local circuits: { Circuit } = {} -- Each circuit stores its source, receiver, and beam pool
-local cooldowns: { [Player]: number } = {} -- Store the next allowed prompt time for each player
+local mirrors: { [BasePart]: Mirror } = {} -- Keyed by part, so a ray hit becomes a mirror lookup in O(1) with no search
+local circuits: { Circuit } = {} -- An array, because the solve check simply loops over every circuit
+local prompts: { ProximityPrompt } = {} -- Collected once, so setMode does not walk controls:GetDescendants() on every change
+local cooldowns: { [Player]: number } = {} -- Next os.clock() time each player may trigger a prompt again
+local doorwayParts: { [BasePart]: true } = {} -- Character parts inside DoorZone, kept by Touched/TouchEnded so it matches the touch events exactly
 
-local mode: Mode = "Routing" -- Routing accepts input, Solved locks input, Resetting protects the door
+local mode: Mode = "Routing"
+local traceQueued = false -- True while a trace is already deferred, so many changes in one frame cost one trace
 
--- A change sets this flag and the next update runs one ray check
-local dirty = true -- Startup needs one full ray check
-local nextTrace = 0 -- This time groups quick changes into one ray check
-local tracePasses = 0 -- This count shows how many ray checks finished
+local doorTween: Tween? = nil -- Kept so a new door move can cancel the running one instead of fighting it
+local doorTarget = closedDoor -- Where the door is heading, which tells whether a close is already running
+local shutterTween: Tween? = nil
+local shutterClosed = false
 
--- These saved tween handles let a new action stop an old tween
-local doorTween: Tween? = nil -- Keep the door tween so another action can stop it
-local closingSince: number? = nil -- Start this timer only after the doorway is empty
+-- RaycastParams is reused, because building new params for every ray creates garbage on each call
+local rayParams = RaycastParams.new()
+rayParams.IncludeInstances = { optics } -- Include list, so walls, mirrors, receivers and the shutter are the only possible hits
 
-local shutterClosed = false -- This selects the open or blocked shutter pose
-local shutterTween: Tween? = nil -- Keep the shutter tween so another action can stop it
+-- Every animated move goes through here, so cancelling the old tween and playing the new one is written once
+local function playTween(previous: Tween?, part: BasePart, info: TweenInfo, target: CFrame): Tween
+	if previous then
+		previous:Cancel() -- Without this, two tweens would write the same CFrame every frame and the part would jitter
+	end
 
--- Ray checks and door checks reuse their filter objects
-local rayParams = RaycastParams.new() -- Reuse the ray filter for every ray check
-rayParams.IncludeInstances = { optics } -- Only parts in Optics can be hit by a ray
-rayParams.IgnoreWater = true -- Water is not part of this indoor puzzle
+	local tween = TweenService:Create(part, info, { CFrame = target })
+	tween:Play()
 
-local overlapParams = OverlapParams.new() -- Reuse the door check filter
-overlapParams.MaxParts = 1 -- One player is enough to keep the door open
-
--- Mark the beam path as changed and let the update loop check it
-local function invalidate() -- Listeners set dirty so the next update checks the beam path
-	dirty = true
+	return tween -- Returned so the caller can store the handle and later listen to Completed
 end
 
--- Make one beam part from the Studio template
+-- Door moves also record their target, which closeDoorWhenClear and the Touched handler read
+local function moveDoor(target: CFrame): Tween
+	doorTarget = target
+	doorTween = playTween(doorTween, door, DOOR_TWEEN, target)
+
+	return doorTween :: Tween -- doorTween was just assigned, so the cast only removes the optional from its type
+end
+
+-- One place switches the mode, so prompts and the console can never disagree with the mode
+local function setMode(value: Mode)
+	mode = value
+
+	for _, prompt in prompts do
+		-- Enabled is set on the server and replicates, so a client cannot trigger a prompt the puzzle has locked
+		prompt.Enabled = value == "Routing" or (value == "Solved" and prompt:GetAttribute("Action") == "Reset")
+	end
+
+	readout.Text = STATUS[value]
+end
+
+-- Clones the template once per pool slot at startup, so tracing never creates or destroys instances
 local function makeSegment(color: Color3, index: number): BasePart
-	local segment = segmentTemplate:Clone() -- The template gives every beam part the same base settings
-	segment.Name = "Segment" .. index -- Name the clone so it can be found in Runtime
-	segment.Color = color -- Apply the circuit color to the clone
-	segment.Parent = visuals -- Add the ready clone to the Runtime folder
+	local segment = segmentTemplate:Clone()
+	segment.Name = "Segment" .. index -- Numbered names make the pool readable in the Explorer while testing
+	segment.Color = color
+	segment.Transparency = 1 -- Starts hidden, and the first trace shows only the slots it uses
+	segment.Parent = visuals -- Parented last, so all properties replicate together in one change
 
 	return segment
 end
 
--- Put one saved beam part between two ray points
-local function showSegment(circuit: Circuit, index: number, start: Vector3, finish: Vector3)
-	local segment = circuit.pool[index] -- Reuse a saved beam part instead of making a new one
-	local length = (finish - start).Magnitude -- The part length matches this beam section
+-- Stretches one pooled part between two points to draw one hop of the beam
+local function showSegment(segment: BasePart, start: Vector3, finish: Vector3)
+	local length = (finish - start).Magnitude
 
-	if length < 0.001 then
-		segment.Transparency = 1 -- Hide a beam part when its two points are too close
-		return
-	end
-
-	segment.Size = Vector3.new(0.09, 0.09, length) -- Resize the saved part to this beam section
-	segment.CFrame = CFrame.lookAt((start + finish) * 0.5, finish) -- Center and aim the part along the beam section
-	segment.Transparency = 0 -- Show only the beam parts used by this ray check
+	segment.Size = Vector3.new(BEAM_THICKNESS, BEAM_THICKNESS, length) -- Z is the long axis, because CFrame.lookAt points -Z at the target
+	segment.CFrame = CFrame.lookAt((start + finish) * 0.5, finish) -- The midpoint centers the part, and lookAt aims its long axis at the finish
+	segment.Transparency = if length < 0.001 then 1 else 0 -- A zero-length hop has no visible direction, so it stays hidden
 end
 
--- Follow one circuit from its source to its receiver
+-- Follows one beam hop by hop and reports if it ended on its own receiver
 local function traceCircuit(circuit: Circuit)
-	local origin = circuit.source.Position -- Start at the source position
-	local direction = circuit.source.CFrame.LookVector -- Start in the source LookVector direction
-	local remaining = MAX_DISTANCE -- Track the distance left for all later hits
-	local powered = false -- This circuit is on only when its receiver is hit
-	local used = 0 -- Count the beam parts used by this check
-	local termination = "Bounce limit" -- Save a reason in case the loop uses every step
+	local origin = circuit.source.Position
+	local direction = circuit.source.CFrame.LookVector -- Already unit length, so direction * remaining is exactly the ray length left
+	local remaining = MAX_DISTANCE
+	local powered = false
+	local used = 0
 
 	for index = 1, MAX_SEGMENTS do
-		local result = workspace:Raycast(origin, direction * remaining, rayParams) -- Find the next hit or the end of the beam path
-		local finish = if result then result.Position else origin + direction * remaining -- Draw to the hit point or to the end of the distance limit
-		showSegment(circuit, index, origin, finish)
-		used = index -- Remember the latest beam part index
+		local result = workspace:Raycast(origin, direction * remaining, rayParams) -- The ray length is the remaining budget, so the full path never exceeds MAX_DISTANCE
+		local finish = if result then result.Position else origin + direction * remaining -- With no hit the beam is drawn to the end of its budget
+
+		showSegment(circuit.pool[index], origin, finish)
+		used = index
 
 		if not result then
-			termination = "Range exhausted" -- End when no hit is found or no distance remains
 			break
 		end
 
-		remaining -= result.Distance -- Remove the traveled distance before the next hit
+		remaining -= result.Distance
 
 		if result.Instance == circuit.receiver then
-			powered = true -- Mark the circuit on after its receiver is hit
-			termination = "Receiver" -- Record that the receiver ended the beam path
+			powered = true -- Only its own receiver counts, the other colour's receiver absorbs the beam like a wall
 			break
 		end
 
-		local hit = result.Instance -- Keep the hit separate before checking its type
-		local mirror = if hit:IsA("BasePart") then mirrors[hit] else nil -- Use the mirror table only for BaseParts
-
+		-- Raycast only returns BaseParts here because Optics holds no terrain, so the cast is safe for the table lookup
+		local mirror = mirrors[result.Instance :: BasePart]
 		if not mirror then
-			termination = "Absorbed" -- Stop at a wall, shutter, or other non-mirror part
-			break
+			break -- Walls, the shutter and the wrong receiver absorb the beam
 		end
 
-		local localNormal = mirror.part.CFrame:VectorToObjectSpace(result.Normal) -- Check the hit normal in mirror space
-		if math.abs(localNormal.Z) < 0.99 then -- Ignore hits on the thin mirror edge
-			termination = "Mirror edge"
-			break
+		-- VectorToObjectSpace rotates the world normal into mirror space, where the two reflective faces point along Z
+		local localNormal = mirror.part.CFrame:VectorToObjectSpace(result.Normal)
+		if math.abs(localNormal.Z) < EDGE_THRESHOLD or remaining <= SURFACE_OFFSET then
+			break -- An edge hit absorbs the beam, and with no budget left there is nothing to draw past the mirror
 		end
 
-		if remaining <= SURFACE_OFFSET then
-			termination = "Range exhausted" -- End when no hit is found or no distance remains
-			break
-		end
-
-		local normal = result.Normal -- Use the world normal for reflection
-		direction = (direction - 2 * direction:Dot(normal) * normal).Unit -- Reflect the beam direction across the mirror normal
-
-		origin = result.Position + direction * SURFACE_OFFSET -- Start past the mirror face to avoid a second hit
-		remaining -= SURFACE_OFFSET -- Count the small gap in the distance limit
+		-- Reflection r = d - 2(d.n)n: d.n is how much of the direction points into the face, removing it twice flips that part and keeps the rest
+		direction = (direction - 2 * direction:Dot(result.Normal) * result.Normal).Unit -- .Unit removes the tiny length drift float math adds on every bounce
+		origin = result.Position + direction * SURFACE_OFFSET
+		remaining -= SURFACE_OFFSET -- The offset is real travel, so it comes out of the same budget
 	end
 
+	-- Slots after the last used one may still show an older, longer path, so only that range is hidden
 	for index = used + 1, circuit.used do
-		circuit.pool[index].Transparency = 1 -- Hide old beam parts after a shorter path
+		circuit.pool[index].Transparency = 1
 	end
 
-	circuit.used = used -- Save the current number of beam parts
-	circuit.termination = termination -- Save the end reason for inspection
-	circuit.source:SetAttribute("Segments", used) -- Share the beam length as an attribute
-	circuit.source:SetAttribute("Termination", termination) -- Share the end reason as an attribute
+	circuit.used = used
 
 	if circuit.powered ~= powered then
-		circuit.powered = powered -- Save the new receiver state
-		circuit.receiver.Color = if powered then circuit.color else DIM -- Match receiver color to its state
-		circuit.receiver:SetAttribute("Powered", powered) -- Share receiver state with the place
+		circuit.powered = powered -- Colour is only written when the state flips, so an unchanged trace replicates nothing
+		circuit.receiver.Color = if powered then circuit.color else DIM
 	end
 end
 
--- Read the mirror step and apply its CFrame
-local function syncMirror(mirror: Mirror)
-	local raw = mirror.part:GetAttribute("Step") -- Read the editable mirror step
+-- Retraces every circuit, then solves the puzzle when all receivers are powered
+local function traceAll()
+	traceQueued = false -- Cleared first, so a change made by this trace's own effects can queue the next one
 
-	if typeof(raw) ~= "number" or raw ~= raw or math.abs(raw) == math.huge then
-		mirror.part:SetAttribute("Step", mirror.step) -- Restore the last safe step when input is not a number
+	local solved = true
+	for _, circuit in circuits do
+		traceCircuit(circuit)
+		solved = solved and circuit.powered
+	end
+
+	if solved and mode == "Routing" then
+		setMode("Solved") -- Locks the mirrors first, so the winning layout cannot be changed while the door opens
+		door.CanCollide = false -- Turned off before the tween, so the moving door never pushes a player
+		moveDoor(raisedDoor)
+	end
+end
+
+-- Called by anything that changes the beam path; this is the only place a trace is scheduled
+local function invalidate()
+	if traceQueued then
 		return
 	end
 
-	local step = math.round(raw) % ROTATION_STEPS -- Round and wrap the value into the supported steps
-	mirror.step = step -- Save the valid step for the next prompt
-	mirror.part.CFrame = mirror.origin * CFrame.Angles(0, step * math.pi / 4, 0) -- Keep the position and rotate the mirror around Y
+	traceQueued = true
+	task.defer(traceAll) -- Runs at the end of the current resumption cycle, so a reset that moves four mirrors costs one trace
+end
 
-	if raw ~= step then
-		mirror.part:SetAttribute("Step", step) -- Write the valid step back to Studio state
-	end
-
+-- Rotates a mirror to a step and asks for a new trace
+local function setMirrorStep(mirror: Mirror, step: number)
+	mirror.step = step % ROTATION_STEPS -- Luau % always returns a result with the divisor's sign, so step + 1 from 7 wraps to 0
+	mirror.part.CFrame = mirror.origin * CFrame.Angles(0, mirror.step * STEP_ANGLE, 0) -- Rotation is built from the saved origin, so turns never accumulate
 	invalidate()
 end
 
--- Keep the in-world console text in step with the mode
-local function updateConsole()
-	local status = "CONNECT BOTH BEAMS!" -- The console starts with the unsolved message
-
-	if mode == "Solved" then
-		status = "PUZZLE SOLVED!" -- Show this only when both circuits are on
-	elseif mode == "Resetting" then
-		status = "RESETTING" -- Show this while reset protects the doorway
-	end
-
-	local surface = console:FindFirstChildOfClass("SurfaceGui") -- The console display is optional
-	local readout = if surface then surface:FindFirstChild("Readout") else nil -- Find the text object only when the display exists
-
-	if readout and readout:IsA("TextLabel") then
-		readout.Text = status -- Show the current mode in the lab
-	end
-end
-
--- Change the shared mode and update every prompt
-local function setMode(value: Mode)
-	mode = value -- Save the mode used by every other system
-	lab:SetAttribute("State", value) -- Share the mode as a place attribute
-	for _, descendant in controls:GetDescendants() do
-		if descendant:IsA("ProximityPrompt") then
-			local isReset = descendant:GetAttribute("Action") == "Reset" -- Reset stays usable after the puzzle is solved
-			descendant.Enabled = value ~= "Resetting" and (value ~= "Solved" or isReset) -- Disable normal prompts during reset and after solving
-		end
-	end
-
-	updateConsole()
-end
-
--- Move the door to a saved CFrame
-local function moveDoor(target: CFrame)
-
-	if doorTween then
-		doorTween:Cancel()
-	end
-
-	local tween = TweenService:Create( -- A local Tween value keeps :Play() type-safe
-		door,
-		TweenInfo.new(0.7, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut),
-		{ CFrame = target }
-	)
-
-	doorTween = tween -- Save the door tween handle
-	tween:Play() -- Start the tween after saving its handle
-end
-
--- Check whether a player is still in the doorway
+-- True while any character part is inside the doorway volume
+-- A server spatial query is not used here: touches are reported by the client that owns the character, ahead of the
+-- server copy of its position, so the query still sees the player for a moment after the last TouchEnded
 local function doorwayOccupied(): boolean
-	local characters: { Instance } = {} -- The filter uses full character models
-
-	for _, player in Players:GetPlayers() do
-		if player.Character then
-			table.insert(characters, player.Character) -- Add each player character to the door filter
+	for part in doorwayParts do
+		if part:IsDescendantOf(workspace) then
+			return true
 		end
+
+		doorwayParts[part] = nil -- A part destroyed inside the zone, for example on respawn, never fires TouchEnded
 	end
 
-	overlapParams.IncludeInstances = characters -- Check only player characters in the door area
-	return #workspace:GetPartBoundsInBox(closedDoor, door.Size + Vector3.new(2, 1, 3), overlapParams) > 0 -- Keep the door open while a player is inside
+	return false
 end
 
--- Return the shutter, mirrors, and door to their starting state
-local function resetPuzzle()
-	setMode("Resetting") -- Disable normal controls before reset starts
-	closingSince = nil -- Clear the reset timer
-	door.CanCollide = false -- An open door must not trap a player
-	moveDoor(raisedDoor)
-
-	if shutterTween then
-		shutterTween:Cancel()
+-- Closes the door after a reset, but only once nobody stands in the doorway
+local function closeDoorWhenClear()
+	if mode ~= "Resetting" or doorTarget == closedDoor or doorwayOccupied() then
+		return -- A close is already running, the door was never opened, or a player would be crushed
 	end
 
-	shutterClosed = false -- Reset always opens the shutter
-	shutter.CFrame = openShutter -- Put the shutter back at its saved open CFrame
+	-- Once fires a single time and disconnects itself, so repeated closes do not pile up Completed connections
+	moveDoor(closedDoor).Completed:Once(function(state: Enum.PlaybackState)
+		if state == Enum.PlaybackState.Completed then
+			door.CanCollide = true -- Collision only returns when the door is fully down, a cancelled close reports Cancelled
+			setMode("Routing")
+		end
+	end)
+end
+
+-- Puts the shutter and mirrors back, and only starts the door sequence when the door is actually open
+local function resetPuzzle()
+	shutterClosed = false
+	shutterTween = playTween(shutterTween, shutter, SHUTTER_TWEEN, openShutter)
 
 	for _, mirror in mirrors do
-		mirror.part:SetAttribute("Step", mirror.initial) -- Reset each mirror to its first step
+		setMirrorStep(mirror, mirror.initial)
 	end
 
-	invalidate()
+	if mode == "Solved" then
+		setMode("Resetting") -- Locks every prompt until the door is closed again
+		closeDoorWhenClear() -- If someone is inside, TouchEnded retries this once they step out
+	end
 end
 
--- Use a per-player wait to stop repeated prompt actions
-local function validInteraction(player: Player, prompt: ProximityPrompt): boolean
-	local now = os.clock() -- Use server time for cooldowns and reset timing
-	if now < (cooldowns[player] or 0) then -- Reject a prompt before its wait ends
+-- Rejects a prompt that arrives before the player's cooldown has ended
+local function validInteraction(player: Player): boolean
+	local now = os.clock() -- Monotonic server clock, so changing the system time cannot skip a cooldown
+
+	if now < (cooldowns[player] or 0) then
 		return false
 	end
 
-	cooldowns[player] = now + INPUT_COOLDOWN -- Set the next time this player may use a prompt
-
+	cooldowns[player] = now + INPUT_COOLDOWN
 	return true
 end
 
--- Route one prompt action to the matching puzzle part
+-- Every prompt routes here, and the Action attribute chooses what it does
 local function handlePrompt(prompt: ProximityPrompt, player: Player)
-
-	if not validInteraction(player, prompt) or mode == "Resetting" then
+	if not validInteraction(player) then
 		return
 	end
 
-	local action = prompt:GetAttribute("Action") -- Prompt attributes choose the action
+	local action = prompt:GetAttribute("Action")
+
+	-- Disabled prompts already cannot fire, the mode checks also cover a prompt that fired in the same frame the mode changed
 	if action == "Reset" then
-		resetPuzzle()
-		return
-	end
-
-	if mode == "Solved" then
-		return
-	end
-
-	if action == "Rotate" then
-		local target = optics:FindFirstChild(tostring(prompt:GetAttribute("Target"))) -- Find only the mirror named by the prompt
-		local mirror = if target and target:IsA("BasePart") then mirrors[target] else nil -- Use the mirror table only for BaseParts
-
-		if mirror then
-			mirror.part:SetAttribute("Step", (mirror.step + 1) % ROTATION_STEPS) -- Move the mirror forward by one step
+		if mode ~= "Resetting" then
+			resetPuzzle()
 		end
-	elseif action == "Shutter" then
-		shutterClosed = not shutterClosed -- Switch between the two shutter poses
+	elseif mode == "Routing" then
+		if action == "Rotate" then
+			local target = optics:FindFirstChild(tostring(prompt:GetAttribute("Target"))) -- The prompt names its mirror, so one handler serves every mirror
+			local mirror = if target then mirrors[target :: BasePart] else nil
 
-		if shutterTween then
-			shutterTween:Cancel()
+			if mirror then
+				setMirrorStep(mirror, mirror.step + 1)
+			end
+		elseif action == "Shutter" then
+			shutterClosed = not shutterClosed
+			shutterTween = playTween(shutterTween, shutter, SHUTTER_TWEEN, if shutterClosed then blockedShutter else openShutter)
 		end
-
-		local target = if shutterClosed then blockedShutter else openShutter -- Choose the new shutter CFrame
-		local tween = TweenService:Create(shutter, TweenInfo.new(0.3), { CFrame = target }) -- A local Tween value keeps :Play() type-safe
-
-		shutterTween = tween -- Save the shutter tween handle
-		tween:Play() -- Start the tween after saving its handle
 	end
 end
 
--- Add every Studio mirror to the mirror table
+-- Every Optics child tagged as a mirror becomes a Mirror, so new mirrors only need the attributes in Studio
 for _, part in optics:GetChildren() do
 	if part:IsA("BasePart") and part:GetAttribute("OpticType") == "Mirror" then
-		local initial = part:GetAttribute("InitialStep") -- Read the mirror step
+		local initial = tonumber(part:GetAttribute("InitialStep")) or 0 -- tonumber returns nil for a missing attribute, so it falls back to step 0
 
 		local mirror: Mirror = {
 			part = part,
-			origin = CFrame.new(part.Position),
+			origin = CFrame.new(part.Position), -- Position only, which drops the authored rotation, so the step alone decides the angle
 			step = initial,
 			initial = initial,
 		}
 
-		mirrors[part] = mirror -- Register the mirror by its part
-		part:SetAttribute("Step", initial) -- Keep the Studio step as the editable value
-		syncMirror(mirror)
-
-		part:GetAttributeChangedSignal("Step"):Connect(function()
-			syncMirror(mirror)
-		end)
+		mirrors[part] = mirror
+		setMirrorStep(mirror, initial)
 	end
 end
 
--- Create the two circuits and their saved beam parts
-for index, name in { "CYAN", "ORANGE" } do
-	local source = emitters:WaitForChild(name) :: BasePart -- Get the source for this circuit
-	local receiver = optics:WaitForChild(name .. "Receiver") :: BasePart -- Get the matching receiver
-	local color = if index == 1 then CYAN else ORANGE -- Pick the color for this circuit
-
+-- Each circuit type gets its source, its receiver and a full beam pool made once
+for _, circuitType in CIRCUIT_TYPES do
 	local circuit: Circuit = {
-		source = source,
-		receiver = receiver,
-		color = color,
+		source = emitters:WaitForChild(circuitType.name) :: BasePart,
+		receiver = optics:WaitForChild(circuitType.name .. "Receiver") :: BasePart,
+		color = circuitType.color,
 		pool = {},
 		used = 0,
 		powered = false,
-		termination = "Pending",
 	}
 
-	for segmentIndex = 1, MAX_SEGMENTS do
-		table.insert(circuit.pool, makeSegment(color, segmentIndex)) -- Fill the circuit beam pool once
+	for index = 1, MAX_SEGMENTS do
+		table.insert(circuit.pool, makeSegment(circuitType.color, index))
 	end
 
-	receiver.Color = DIM -- Receivers start off
-	receiver:SetAttribute("Powered", false) -- Receivers start with a shared off state
-	table.insert(circuits, circuit) -- Add this circuit to the solve check
-
-	source:GetPropertyChangedSignal("CFrame"):Connect(invalidate) -- A moved source needs a new ray check
+	circuit.receiver.Color = DIM
+	table.insert(circuits, circuit) -- This runs before the deferred first trace, so that trace already sees every circuit
 end
 
--- Changes to an optic part request a new ray check
-for _, part in optics:GetDescendants() do
-	if part:IsA("BasePart") then
-		part:GetPropertyChangedSignal("CFrame"):Connect(invalidate) -- A moved optic needs a new ray check
-		part:GetPropertyChangedSignal("Size"):Connect(invalidate) -- A resized optic needs a new ray check
+for _, descendant in controls:GetDescendants() do
+	if descendant:IsA("ProximityPrompt") then
+		table.insert(prompts, descendant)
 	end
 end
 
--- All prompt actions enter through one server event
+-- The shutter is the only optic that moves by tween, mirrors call invalidate themselves in setMirrorStep
+shutter:GetPropertyChangedSignal("CFrame"):Connect(invalidate)
+
 ProximityPromptService.PromptTriggered:Connect(handlePrompt)
 
--- Remove player data when the player leaves
-Players.PlayerRemoving:Connect(function(player)
-	cooldowns[player] = nil -- Remove the player from the cooldown table
-end)
+-- A player stepping into a closing doorway sends the door back up instead of closing on them
+doorZone.Touched:Connect(function(hit: BasePart)
+	local character = hit:FindFirstAncestorOfClass("Model") -- Accessories put parts one level deeper, so the nearest Model is the character
 
--- The update loop traces changed beams and controls reset safety
-RunService.Heartbeat:Connect(function()
-	local now = os.clock() -- Use server time for cooldowns and reset timing
-
-	if dirty and now >= nextTrace then -- Trace only after a change and after the wait time
-		dirty = false -- Clear the flag before tracing
-		nextTrace = now + TRACE_INTERVAL -- Set the next allowed trace time
-
-		for _, circuit in circuits do
-			traceCircuit(circuit)
-		end
-
-		tracePasses += 1 -- Count completed ray checks
-		lab:SetAttribute("TracePasses", tracePasses)
+	if not (character and Players:GetPlayerFromCharacter(character)) then
+		return -- Only player characters can be trapped, other loose parts do not hold the door
 	end
 
-	if mode == "Routing" then
-		if circuits[1].powered and circuits[2].powered and not dirty then -- Solve only when both receivers are on
+	doorwayParts[hit] = true
 
-			setMode("Solved") -- Lock prompts before opening the door
-			door.CanCollide = false -- An open door must not trap a player
-			moveDoor(raisedDoor)
-		end
-	elseif mode == "Resetting" then
-
-		if doorwayOccupied() then -- Keep the door up while a player is inside
-			if closingSince then
-				closingSince = nil -- Clear the reset timer
-				moveDoor(raisedDoor)
-			end
-
-		elseif not closingSince then -- Start closing only after an empty doorway check
-			closingSince = now
-			moveDoor(closedDoor)
-
-		elseif now - closingSince >= 0.75 then -- Wait for the closing tween before restoring collision
-			door.CFrame = closedDoor -- Snap to the exact closed CFrame
-			door.CanCollide = true -- Restore collision after the doorway is clear
-			closingSince = nil -- Clear the reset timer
-			setMode("Routing")
-		end
+	if mode == "Resetting" and doorTarget == closedDoor then
+		moveDoor(raisedDoor) -- Cancels the close tween, its Completed reports Cancelled, so collision stays off
 	end
 end)
 
--- Start with controls enabled and the console in its first state
-setMode("Routing")
+-- Each part leaving the zone retries the close, and doorwayOccupied blocks it until the last part is out
+doorZone.TouchEnded:Connect(function(hit: BasePart)
+	doorwayParts[hit] = nil
+	closeDoorWhenClear()
+end)
+
+Players.PlayerRemoving:Connect(function(player: Player)
+	cooldowns[player] = nil -- Player objects are table keys, so leaving players are removed or the table keeps growing
+end)
+
+setMode("Routing") -- Applies the start state to the prompts and the console
